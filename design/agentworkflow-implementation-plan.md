@@ -31,6 +31,79 @@
 
 ---
 
+## Testing strategy
+
+Three layers; push every edge case as far **down** the pyramid as it goes, and **mirror every real-E2E failure with a unit test of the same condition** (fast feedback + regression):
+
+1. **Unit (no cluster) — where the edge cases live.** Core logic is **pure or interface-injected** so the whole matrix is table tests:
+   - `ValidateLinearChain(nodes, edges)` and `ValidateSpec(spec, resolved)` are **pure functions** → every malformed-graph / bad-ref / missing-egress case is one row.
+   - The runner depends on an **`A2AClient` interface** (real in prod; **fake** in unit) → simulate node success / error / timeout / oversized output / missing-or-garbled handoff / spoofed push — all in unit.
+   - Git verification sits behind a **`Verifier` interface** (`VerifyPush(repo,branch,sha) (bool,error)`) → verified / not-on-remote / ls-remote-error in unit.
+2. **Integration (`envtest`) — wiring only.** A handful of representative specs confirm the controller emits the right `Accepted`/`Ready` conditions and creates the Deployment + mux registration. Not where the matrix is exhausted.
+3. **Real E2E (`kind` + `helm`, zero mocks).** Real kagent install, real `Agent`s, and a **real in-cluster git remote (a `gitea` Deployment in the kind cluster)**. Covers the happy path **and the key real failures** (agent error; node doesn't push → gate re-prompts → exhausts → run fails; recover-on-2nd-prompt). Wrap every e2e invocation in `gtimeout 1500`.
+
+**Seams to build first (they make the matrix unit-testable):** the `A2AClient` interface + fake (Phase 3), the `Verifier` interface + fake (Phase 5), and pure `ValidateLinearChain` / `ValidateSpec` (Phase 2). The phases below introduce each before the tests that need it.
+
+## Edge-case matrix (unit-first)
+
+Layer key: **U** = unit · **I** = envtest · **E** = real e2e on kind. **Every E row also has a U mirror.**
+
+**Phase 1 — CRD field validation (apiserver, via envtest apply):**
+
+| Case | Layer |
+|---|---|
+| node `name`: uppercase / underscore / leading-digit / empty / >63 chars | U(I) |
+| `nodes: []` (MinItems) · `nodes` >20 · `edges` >40 (MaxItems) | U(I) |
+| invalid `workspace` enum · `maxRetries` < 0 | U(I) |
+
+**Phase 2 — graph + spec validation (pure → U; 1 representative each → I):**
+
+| Case | Layer |
+|---|---|
+| linear ✓ · single-node ✓ | U |
+| self-loop `a→a` · 2-cycle · long cycle | U |
+| fork (multi-out) · join (multi-in) · two entries · no entry (all-cycle) · multiple terminals | U |
+| disconnected · edge references unknown node · duplicate edge | U |
+| duplicate node `name` · duplicate `outputKey` · reserved `input` used as `outputKey` | U |
+| `agentRef` unresolved · cross-namespace ref | U (fake resolver) + I |
+| workspace set but `gitAuthSecretRef` missing | U + I |
+| RO/RW node agent missing repo-host egress · `allowedDomains` empty (deny-all) | U + I |
+
+**Phase 3 — context runtime (fake `A2AClient` → U):**
+
+| Case | Layer |
+|---|---|
+| templating: unknown key · default `outputKey`=name · reference any earlier output · `{input}` · empty input→use predecessor · first node w/o input | U |
+| state value exceeds 256KiB cap | U |
+| node returns error · node times out (per-node 300s) | U + E |
+| output template references a missing key | U |
+| single-node workflow (entry == terminal) | U + E |
+| untagged `DataPart` dropped · tagged `kagent_type` kept | U |
+| 2-node deterministic hand-off (happy path) | E |
+
+**Phase 4 — workspace (handoff/coords → U; real git → E):**
+
+| Case | Layer |
+|---|---|
+| handoff: absent · malformed JSON · `committed:false` · `pushed:false` · missing `commit` · extra fields | U |
+| coords: RO vs RW message content · `None` node gets none | U |
+| per-run branch naming | U |
+| RW push + RO read; ref advances across nodes (real gitea) | E |
+
+**Phase 5 — readiness gate (fake `A2AClient` + `Verifier` → U; real → E):**
+
+| Case | Layer |
+|---|---|
+| verify: SHA present · SHA absent · `verifyPush:false` (trust) · `ls-remote` error → not-verified | U |
+| re-prompt: ready 1st · ready 2nd · never ready → exhaust → fail · `maxRetries:0` | U |
+| spoof (claims pushed, didn't) → reject → re-prompt → exhaust → fail | U + E |
+| recover on 2nd prompt (real push) | U + E |
+| credential absent from messages / outputs / logs · cross-run branch isolation | U (log scan) + E |
+
+> **Where the seams are introduced:** Phase 2 builds the pure `ValidateLinearChain`/`ValidateSpec`; Phase 3 builds the `A2AClient` interface + a `fakeA2AClient` (canned success/error/timeout/oversize/handoff responses); Phase 5 builds the `Verifier` interface + a `fakeVerifier`. The E2E git remote is a `gitea` Deployment added to the kind setup in Phase 4 (the BYO agent's `spec.sandbox.network.allowedDomains` must include its in-cluster host).
+
+---
+
 ## Phase 1 — CRD types + codegen
 
 **Goal:** `AgentWorkflow` types compile, generate a CRD, install into a cluster, and reject malformed field values. No controller behaviour yet.
